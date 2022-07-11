@@ -1,12 +1,16 @@
 package com.walmart.focus
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.Rect
 import android.os.Bundle
+import android.util.AttributeSet
 import android.util.Log
 import android.view.View
 import android.widget.Toast
+import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
@@ -17,31 +21,32 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.bumptech.glide.Glide
-import com.google.mlkit.common.model.LocalModel
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.custom.CustomObjectDetectorOptions
 import com.walmart.focus.databinding.ActivityMainBinding
+import com.walmart.focus.viewmodel.MainViewModel
+import com.walmart.focus.viewmodel.MainViewModelFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import javax.inject.Inject
 
 class MainActivity : AppCompatActivity() {
 
     private var imageCapture: ImageCapture? = null
+    private var bitmap: Bitmap? = null
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var binding: ActivityMainBinding
 
+    private lateinit var viewModel: MainViewModel
+
     companion object {
-        const val REQUEST_CODE_CAMERA_PERMISSION = 0
+        const val REQUEST_CODE_CAMERA_PERMISSION = 100
         const val TAG = "MainActivity"
-        private const val MAX_FONT_SIZE = 96F
-        private const val OD_TF_LITE = "cereal_model.tflite"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        viewModel = MainViewModel()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -50,6 +55,28 @@ class MainActivity : AppCompatActivity() {
         binding.captureButton.setOnClickListener { binding.viewFinder.bitmap?.let { setViewAndDetect(it) } }
         binding.retry.setOnClickListener { reset() }
         cameraExecutor = Executors.newSingleThreadExecutor()
+    }
+
+    override fun onCreateView(name: String, context: Context, attrs: AttributeSet): View? {
+        viewModel.detectionResultList.observe(this) {
+            bitmap?.let { capturedBitMap -> drawDetectionResult(capturedBitMap, it) }
+        }
+
+        return super.onCreateView(name, context, attrs)
+    }
+
+    // Draw the detection result on the bitmap and show it.
+    private fun drawDetectionResult(capturedBitMap: Bitmap,
+        it: Pair<String, ArrayList<DetectionResult>>) {
+        val imgWithResult = viewModel.drawDetectionResult(capturedBitMap, it.second)
+        runOnUiThread {
+            binding.capturedPhoto.setImageBitmap(imgWithResult)
+        }
+
+        binding.classificationLabelView.visibility = View.VISIBLE
+        binding.classificationLabel.text =
+            it.first.ifEmpty { "No Classification Available" }
+        Log.i(TAG, "classification_label: ${it.first}")
     }
 
     private fun startCamera() {
@@ -61,6 +88,9 @@ class MainActivity : AppCompatActivity() {
             val preview = Preview.Builder().build()
                 .also { it.setSurfaceProvider(binding.viewFinder.surfaceProvider) }
 
+            /*
+             *  Todo: Add Image Analyzer and move object detection there.
+             */
             imageCapture = ImageCapture.Builder().build()
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
             try {
@@ -124,117 +154,9 @@ class MainActivity : AppCompatActivity() {
         image?.close()
 
         lifecycleScope.launch(Dispatchers.Default) {
-            runObjectDetection(bitmap)
+            this@MainActivity.bitmap = bitmap
+            viewModel.runObjectDetection(bitmap)
         }
-    }
-
-    /**
-     * runObjectDetection(bitmap: Bitmap)
-     * TFLite Object Detection function
-     */
-    private fun runObjectDetection(bitmap: Bitmap) {
-        try {
-            val localModel = LocalModel.Builder()
-                .setAssetFilePath(OD_TF_LITE)
-                .build()
-
-            // Multiple object detection in static images
-            val customObjectDetectorOptions =
-                CustomObjectDetectorOptions.Builder(localModel)
-                    .setDetectorMode(CustomObjectDetectorOptions.SINGLE_IMAGE_MODE)
-                    .enableMultipleObjects()
-                    .enableClassification()
-                    .setClassificationConfidenceThreshold(0.5f)
-                    .setMaxPerObjectLabelCount(3)
-                    .build()
-
-            // Initialize the detector object
-            val objectDetector =
-                ObjectDetection.getClient(customObjectDetectorOptions)
-
-            // Feed given image to the detector
-            // Parse the detection result and show it
-            objectDetector
-                .process(InputImage.fromBitmap(bitmap, 0))
-                .addOnFailureListener { e ->
-                    Log.e(TAG, "Error while detecting object", e)
-                }.addOnSuccessListener { results ->
-                    var outputText = ""
-                    val resultToDisplay = ArrayList<DetectionResult>()
-
-                    for (detectedObject in results) {
-                        if (detectedObject.labels.size > 0) {
-                            outputText += if (outputText.isNotEmpty()) "\n" else ""
-                            outputText += "${detectedObject.labels[0].text} : ${detectedObject.labels[0].confidence}"
-                            println("detectedObject.boundingBox: ${detectedObject.boundingBox}")
-                            resultToDisplay.add(
-                                DetectionResult(
-                                    detectedObject.boundingBox,
-                                    "${detectedObject.labels[0].text}, ${detectedObject.labels[0].confidence}%"
-                                )
-                            )
-                        }
-                    }
-
-                    // Draw the detection result on the bitmap and show it.
-                    val imgWithResult = drawDetectionResult(bitmap, resultToDisplay)
-                    runOnUiThread {
-                        binding.capturedPhoto.setImageBitmap(imgWithResult)
-                    }
-
-                    binding.classificationLabelView.visibility = View.VISIBLE
-                    binding.classificationLabel.text =
-                        outputText.ifEmpty { "No Classification Available" }
-                    Log.i(TAG, "classification_label: $outputText")
-                }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error while detecting and classifying objects", e)
-        }
-    }
-
-    /**
-     * drawDetectionResult(bitmap: Bitmap, detectionResults: List<DetectionResult>
-     *      Draw a box around each objects and show the object's name.
-     */
-    private fun drawDetectionResult(
-        bitmap: Bitmap,
-        detectionResults: List<DetectionResult>
-    ): Bitmap {
-        val outputBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(outputBitmap)
-        val pen = Paint()
-        pen.textAlign = Paint.Align.LEFT
-
-        detectionResults.forEach {
-            // draw bounding box
-            pen.color = Color.RED
-            pen.strokeWidth = 6F
-            pen.style = Paint.Style.STROKE
-            val box = it.boundingBox
-            canvas.drawRect(box, pen)
-
-            val tagSize = Rect(0, 0, 0, 0)
-
-            // calculate the right font size
-            pen.style = Paint.Style.FILL_AND_STROKE
-            pen.color = Color.YELLOW
-            pen.strokeWidth = 2F
-
-            pen.textSize = MAX_FONT_SIZE
-            pen.getTextBounds(it.text, 0, it.text.length, tagSize)
-            val fontSize: Float = pen.textSize * box.width() / tagSize.width()
-
-            // adjust the font size so texts are inside the bounding box
-            if (fontSize < pen.textSize) pen.textSize = fontSize
-
-            var margin = (box.width() - tagSize.width()) / 2.0F
-            if (margin < 0F) margin = 0F
-            canvas.drawText(
-                it.text, box.left + margin,
-                box.top + tagSize.height().times(1F), pen
-            )
-        }
-        return outputBitmap
     }
 }
 
